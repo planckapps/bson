@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+permissions:
+  contents: write # needed by the release job to create a Release
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)   ZIG_ARCH="x86_64-linux" ;;
+            Linux-aarch64)  ZIG_ARCH="aarch64-linux" ;;
+            Darwin-arm64)   ZIG_ARCH="aarch64-macos" ;;
+            Darwin-x86_64)  ZIG_ARCH="x86_64-macos" ;;
+          esac
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" | tar xJ
+          echo "$(pwd)/zig-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install Zig (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/${env:ZIG_VERSION}/zig-x86_64-windows-${env:ZIG_VERSION}.zip"
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive zig.zip -DestinationPath .
+          "$(Get-Location)\zig-x86_64-windows-${env:ZIG_VERSION}" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Verify Zig
+        run: zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        # Skips gracefully if the library's build.zig has no `test` step.
+        shell: bash
+        run: |
+          if zig build --help 2>&1 | grep -qE '^\s+test\b'; then
+            zig build test
+          else
+            echo "No 'test' step in build.zig — skipping."
+          fi
+
+  # ── Release (tag push only) ────────────────────────────────────
+  # Creates a GitHub Release tied to the tag. GitHub automatically
+  # publishes the source archive at:
+  #   https://github.com/<owner>/<repo>/archive/refs/tags/<tag>.tar.gz
+  # which is exactly what consumers reference in their build.zig.zon.
+  # No assets to upload — the archive URL is enough.
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
+          generate_release_notes: true
+          body: |
+            Consume in your `build.zig.zon`:
+
+            ```bash
+            zig fetch --save=${{ github.event.repository.name }} ${{ github.server_url }}/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz
+            ```
+
+            That writes the entry below into `build.zig.zon` with the correct hash:
+
+            ```zig
+            .${{ github.event.repository.name }} = .{
+                .url = "${{ github.server_url }}/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz",
+                .hash = "...",
+            },
+            ```
